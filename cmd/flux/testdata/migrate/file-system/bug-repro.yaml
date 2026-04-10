@@ -1,0 +1,7 @@
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+# This is a comment
+kind: ImagePolicy
+---
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+
+kind: ImagePolicy

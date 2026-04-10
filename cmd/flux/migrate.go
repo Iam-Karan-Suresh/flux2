@@ -182,6 +182,12 @@ var migrateFlags struct {
 	extensions []string
 }
 
+// kindSearchWindow is the max number of lines between apiVersion: and kind:
+// in a single resource block. Caps memory and prevents runaway scanning
+// on malformed or large prose files.
+const kindSearchWindow = 20
+
+
 func init() {
 	rootCmd.AddCommand(migrateCmd)
 
@@ -623,20 +629,30 @@ func (f *FileSystemMigrator) detectFileUpgrades(file string) ([]APIUpgrade, erro
 			logger.Warningf("%s:%d: %v", file, line+1, err)
 			continue
 		}
-
-		// Parse kind.
-		if line+1 >= len(lines) {
-			continue
-		}
-		kindLine := lines[line+1]
+		// Parse kind — search forward up to kindSearchWindow lines.
+		// A new apiVersion: line within the window means a new resource
+		// block has started, so we stop immediately.
 		const kindPrefix = "kind: "
-		idx = strings.Index(kindLine, kindPrefix)
-		if idx == -1 {
+		var kind string
+		for j := line + 1; j <= line+kindSearchWindow && j < len(lines); j++ {
+			// A new apiVersion: signals a new resource block — stop.
+			if strings.Contains(lines[j], "apiVersion: ") {
+				break
+			}
+			idx = strings.Index(lines[j], kindPrefix)
+			if idx == -1 {
+				continue
+			}
+			kindValue := strings.TrimSpace(lines[j][idx+len(kindPrefix):])
+			if i := strings.IndexByte(kindValue, ' '); i != -1 {
+				kindValue = kindValue[:i]
+			}
+			kind = kindValue
+			break
+		}
+		if kind == "" {
 			continue
 		}
-		kindValuePrefix := strings.TrimSpace(kindLine[idx+len(kindPrefix):])
-		kind := strings.Split(kindValuePrefix, " ")[0]
-
 		// Build GroupKind.
 		gk := schema.GroupKind{
 			Group: gv.Group,
@@ -699,4 +715,94 @@ func (f *FileSystemMigrator) migrateFile(fileUpgrades *FileAPIUpgrades) error {
 	}
 
 	return nil
+}
+// detectFileUpgradesOld is the original implementation kept for benchmarking only.
+// TODO: remove after PR is merged.
+func (f *FileSystemMigrator) detectFileUpgradesOld(lines []string) ([]APIUpgrade, error) {
+    var fileUpgrades []APIUpgrade
+    for line, apiVersionLine := range lines {
+        const apiVersionPrefix = "apiVersion: "
+        idx := strings.Index(apiVersionLine, apiVersionPrefix)
+        if idx == -1 {
+            continue
+        }
+        apiVersionValuePrefix := strings.TrimSpace(apiVersionLine[idx+len(apiVersionPrefix):])
+        apiVersion := strings.Split(apiVersionValuePrefix, " ")[0]
+        gv, err := schema.ParseGroupVersion(apiVersion)
+        if err != nil {
+            continue
+        }
+        // OLD: only checks line+1
+        if line+1 >= len(lines) {
+            continue
+        }
+        kindLine := lines[line+1]
+        const kindPrefix = "kind: "
+        idx = strings.Index(kindLine, kindPrefix)
+        if idx == -1 {
+            continue
+        }
+        kindValuePrefix := strings.TrimSpace(kindLine[idx+len(kindPrefix):])
+        kind := strings.Split(kindValuePrefix, " ")[0]
+        gk := schema.GroupKind{Group: gv.Group, Kind: kind}
+        latestVersion, ok := f.latestVersions[gk]
+        if !ok || latestVersion == gv.Version {
+            continue
+        }
+        fileUpgrades = append(fileUpgrades, APIUpgrade{
+            Line:       line,
+            Kind:       kind,
+            OldVersion: gv.Version,
+            NewVersion: latestVersion,
+        })
+    }
+    return fileUpgrades, nil
+}
+
+// detectFileUpgradesNew is the fixed implementation with forward-window scan.
+func (f *FileSystemMigrator) detectFileUpgradesNew(lines []string) ([]APIUpgrade, error) {
+    var fileUpgrades []APIUpgrade
+    for line, apiVersionLine := range lines {
+        const apiVersionPrefix = "apiVersion: "
+        idx := strings.Index(apiVersionLine, apiVersionPrefix)
+        if idx == -1 {
+            continue
+        }
+        apiVersionValuePrefix := strings.TrimSpace(apiVersionLine[idx+len(apiVersionPrefix):])
+        apiVersion := strings.Split(apiVersionValuePrefix, " ")[0]
+        gv, err := schema.ParseGroupVersion(apiVersion)
+        if err != nil {
+            continue
+        }
+        // NEW: forward-window scan up to kindSearchWindow lines
+        const kindPrefix = "kind: "
+        var kind string
+        for j := line + 1; j <= line+kindSearchWindow && j < len(lines); j++ {
+            if strings.Contains(lines[j], "apiVersion: ") {
+                break
+            }
+            idx2 := strings.Index(lines[j], kindPrefix)
+            if idx2 == -1 {
+                continue
+            }
+            kindValuePrefix := strings.TrimSpace(lines[j][idx2+len(kindPrefix):])
+            kind = strings.Split(kindValuePrefix, " ")[0]
+            break
+        }
+        if kind == "" {
+            continue
+        }
+        gk := schema.GroupKind{Group: gv.Group, Kind: kind}
+        latestVersion, ok := f.latestVersions[gk]
+        if !ok || latestVersion == gv.Version {
+            continue
+        }
+        fileUpgrades = append(fileUpgrades, APIUpgrade{
+            Line:       line,
+            Kind:       kind,
+            OldVersion: gv.Version,
+            NewVersion: latestVersion,
+        })
+    }
+    return fileUpgrades, nil
 }
