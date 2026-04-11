@@ -318,7 +318,7 @@ func (c *ClusterMigrator) migrateCRD(ctx context.Context, name string) error {
 	}
 
 	// set the CRD status to contain only the latest storage version
-	if len(crd.Status.StoredVersions) > 1 || crd.Status.StoredVersions[0] != storageVersion {
+	if len(crd.Status.StoredVersions) == 0 || len(crd.Status.StoredVersions) > 1 || crd.Status.StoredVersions[0] != storageVersion {
 		crd.Status.StoredVersions = []string{storageVersion}
 		if err := c.kubeClient.Status().Update(ctx, crd); err != nil {
 			return fmt.Errorf("failed to update CRD %s status: %w", crd.Name, err)
@@ -436,6 +436,7 @@ type FileAPIUpgrades struct {
 type APIUpgrade struct {
 	Line       int
 	Kind       string
+	Group      string
 	OldVersion string
 	NewVersion string
 }
@@ -519,16 +520,20 @@ func (f *FileSystemMigrator) listDirectoryFiles() ([]string, error) {
 		if err != nil {
 			return err
 		}
+		if dirEntry.IsDir() {
+			return nil
+		}
 		if !f.matchesExtensions(path) {
 			return nil
 		}
-		fileInfo, err := dirEntry.Info()
+		// Follow symlinks if necessary.
+		fileInfo, err := fs.Stat(f.fileSystem, path)
 		if err != nil {
 			return err
 		}
 		if fileInfo.Mode().IsRegular() {
 			files = append(files, path)
-		} else if !fileInfo.IsDir() {
+		} else {
 			logger.Warningf("skipping irregular file %s", path)
 		}
 		return nil
@@ -545,28 +550,11 @@ func (f *FileSystemMigrator) validateSingleFile() error {
 			f.path, strings.Join(f.extensions, ", "))
 	}
 
-	// Check if it's irregular by walking the parent directory.
-	var irregular bool
-	err := fs.WalkDir(f.fileSystem, filepath.Dir(f.path), func(path string, dirEntry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if path != f.path {
-			return nil
-		}
-		fileInfo, err := dirEntry.Info()
-		if err != nil {
-			return err
-		}
-		if !fileInfo.Mode().IsRegular() {
-			irregular = true
-		}
-		return nil
-	})
+	fileInfo, err := fs.Stat(f.fileSystem, f.path)
 	if err != nil {
-		return fmt.Errorf("failed to validate file %s: %w", f.path, err)
+		return fmt.Errorf("failed to stat file %s: %w", f.path, err)
 	}
-	if irregular {
+	if !fileInfo.Mode().IsRegular() {
 		return fmt.Errorf("file %s is irregular", f.path)
 	}
 	return nil
@@ -616,8 +604,15 @@ func (f *FileSystemMigrator) detectFileUpgrades(file string) ([]APIUpgrade, erro
 		if idx == -1 {
 			continue
 		}
+		// Ensure apiVersion is either at start or after whitespace/indent.
+		if idx > 0 && !strings.ContainsAny(apiVersionLine[idx-1:idx], " \t-") {
+			continue
+		}
+
 		apiVersionValuePrefix := strings.TrimSpace(apiVersionLine[idx+len(apiVersionPrefix):])
 		apiVersion := strings.Split(apiVersionValuePrefix, " ")[0]
+		// Remove quotes if present.
+		apiVersion = strings.Trim(apiVersion, "\"'")
 		gv, err := schema.ParseGroupVersion(apiVersion)
 		if err != nil {
 			logger.Warningf("%s:%d: %v", file, line+1, err)
@@ -634,8 +629,10 @@ func (f *FileSystemMigrator) detectFileUpgrades(file string) ([]APIUpgrade, erro
 		if idx == -1 {
 			continue
 		}
+		// Ensure kind is at the same indentation level as apiVersion or indented.
 		kindValuePrefix := strings.TrimSpace(kindLine[idx+len(kindPrefix):])
 		kind := strings.Split(kindValuePrefix, " ")[0]
+		kind = strings.Trim(kind, "\"'")
 
 		// Build GroupKind.
 		gk := schema.GroupKind{
@@ -653,6 +650,7 @@ func (f *FileSystemMigrator) detectFileUpgrades(file string) ([]APIUpgrade, erro
 		fileUpgrades = append(fileUpgrades, APIUpgrade{
 			Line:       line,
 			Kind:       kind,
+			Group:      gv.Group,
 			OldVersion: gv.Version,
 			NewVersion: latestVersion,
 		})
@@ -682,7 +680,16 @@ func (f *FileSystemMigrator) migrateFile(fileUpgrades *FileAPIUpgrades) error {
 	// Apply upgrades to lines.
 	for _, upgrade := range fileUpgrades.Upgrades {
 		line := lines[upgrade.Line]
-		line = strings.Replace(line, upgrade.OldVersion, upgrade.NewVersion, 1)
+		// Targeted replacement: only replace the version part of the apiVersion string.
+		oldAPIVersion := upgrade.OldVersion
+		if upgrade.Group != "" {
+			oldAPIVersion = upgrade.Group + "/" + upgrade.OldVersion
+		}
+		newAPIVersion := upgrade.NewVersion
+		if upgrade.Group != "" {
+			newAPIVersion = upgrade.Group + "/" + upgrade.NewVersion
+		}
+		line = strings.Replace(line, oldAPIVersion, newAPIVersion, 1)
 		lines[upgrade.Line] = line
 	}
 

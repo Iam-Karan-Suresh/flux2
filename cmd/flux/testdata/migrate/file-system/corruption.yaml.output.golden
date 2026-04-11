@@ -1,0 +1,4 @@
+► starting migration of custom resources
+✚ testdata/migrate/file-system/corruption.yaml:7: ImageRepository v1beta1 -> v1
+✔ file testdata/migrate/file-system/corruption.yaml migrated successfully
+✔ custom resources migrated successfully
